@@ -18,7 +18,9 @@
     registered: bool,
     total-earned: uint,
     total-burned: uint,
-    conservation-score: uint
+    conservation-score: uint,
+    practices-completed: uint,
+    loyalty-tier: uint
 })
 
 (define-map oracles principal {
@@ -67,7 +69,9 @@
             registered: true,
             total-earned: u0,
             total-burned: u0,
-            conservation-score: u100
+            conservation-score: u100,
+            practices-completed: u0,
+            loyalty-tier: u0
         })
         (print {operation: "farmer-registered", farmer: tx-sender})
         (ok true)))
@@ -105,7 +109,11 @@
         (asserts! (> practice-rate u0) err-invalid-practice)
         (asserts! (<= efficiency-score u100) err-invalid-amount)
         
-        (let ((credits-to-mint (* practice-rate (/ efficiency-score u10))))
+        (let ((base-credits (* practice-rate (/ efficiency-score u10)))
+              (practices-done (+ (get practices-completed farmer-info) u1))
+              (new-tier (calculate-tier practices-done))
+              (tier-multiplier (get-tier-multiplier new-tier))
+              (credits-to-mint (/ (* base-credits tier-multiplier) u100)))
             (try! (ft-mint? water-credits credits-to-mint farmer))
             (map-set farmer-balances farmer (+ (default-to u0 (map-get? farmer-balances farmer)) credits-to-mint))
             (var-set total-supply (+ (var-get total-supply) credits-to-mint))
@@ -114,7 +122,9 @@
                 total-earned: (+ (get total-earned farmer-info) credits-to-mint),
                 conservation-score: (if (> (+ (get conservation-score farmer-info) (/ efficiency-score u20)) u100)
                                     u100
-                                    (+ (get conservation-score farmer-info) (/ efficiency-score u20)))
+                                    (+ (get conservation-score farmer-info) (/ efficiency-score u20))),
+                practices-completed: practices-done,
+                loyalty-tier: new-tier
             }))
             
             (map-set oracles tx-sender (merge oracle-info {
@@ -127,6 +137,8 @@
                 practice: practice,
                 efficiency: efficiency-score,
                 credits: credits-to-mint,
+                tier: new-tier,
+                multiplier: tier-multiplier,
                 oracle: tx-sender
             })
             (ok credits-to-mint))))
@@ -203,6 +215,54 @@
           (balance (default-to u0 (map-get? farmer-balances farmer)))
           (conservation-score (get conservation-score farmer-info)))
         (ok (* balance (+ u1 (/ conservation-score u100))))))
+
+(define-read-only (calculate-tier (practices-completed uint))
+    (if (>= practices-completed u50)
+        u4
+        (if (>= practices-completed u25)
+            u3
+            (if (>= practices-completed u10)
+                u2
+                (if (>= practices-completed u3)
+                    u1
+                    u0)))))
+
+(define-read-only (get-tier-multiplier (tier uint))
+    (if (is-eq tier u4)
+        u150
+        (if (is-eq tier u3)
+            u130
+            (if (is-eq tier u2)
+                u115
+                (if (is-eq tier u1)
+                    u105
+                    u100)))))
+
+(define-read-only (get-farmer-tier (farmer principal))
+    (match (map-get? farmers farmer)
+        farmer-info (ok (get loyalty-tier farmer-info))
+        (err u404)))
+
+(define-read-only (get-tier-info (farmer principal))
+    (match (map-get? farmers farmer)
+        farmer-info (ok {
+            tier: (get loyalty-tier farmer-info),
+            practices: (get practices-completed farmer-info),
+            multiplier: (get-tier-multiplier (get loyalty-tier farmer-info)),
+            next-tier-at: (get-next-tier-threshold (get loyalty-tier farmer-info))
+        })
+        (err u404)))
+
+(define-read-only (get-next-tier-threshold (current-tier uint))
+    (if (is-eq current-tier u4)
+        u0
+        (if (is-eq current-tier u3)
+            u50
+            (if (is-eq current-tier u2)
+                u25
+                (if (is-eq current-tier u1)
+                    u10
+                    u3)))))
 
 (begin
     (map-set practice-rates "drip-irrigation" u50)
