@@ -8,6 +8,11 @@
 (define-constant err-farmer-not-registered (err u104))
 (define-constant err-oracle-exists (err u105))
 (define-constant err-invalid-practice (err u106))
+(define-constant err-lease-not-found (err u107))
+(define-constant err-lease-expired (err u108))
+(define-constant err-already-leased (err u109))
+(define-constant err-invalid-duration (err u110))
+(define-constant err-insufficient-lease-amount (err u111))
 
 (define-data-var token-name (string-ascii 32) "Water Credits")
 (define-data-var token-symbol (string-ascii 10) "WC")
@@ -31,6 +36,18 @@
 (define-map practice-rates (string-ascii 50) uint)
 
 (define-map farmer-balances principal uint)
+
+(define-map leases
+    {lessor: principal, lessee: principal}
+    {
+        amount: uint,
+        rate-per-block: uint,
+        start-block: uint,
+        end-block: uint,
+        active: bool
+    })
+
+(define-map active-leases-count principal uint)
 
 (define-public (get-name)
     (ok (var-get token-name)))
@@ -64,7 +81,7 @@
 
 (define-public (register-farmer)
     (begin
-        (asserts! (is-none (map-get? farmers tx-sender)) (err u107))
+        (asserts! (is-none (map-get? farmers tx-sender)) (err u112))
         (map-set farmers tx-sender {
             registered: true,
             total-earned: u0,
@@ -186,6 +203,97 @@
         (print {operation: "emergency-mint", farmer: farmer, amount: amount})
         (ok true)))
 
+(define-public (create-lease (lessee principal) (amount uint) (rate-per-block uint) (duration uint))
+    (let ((lessor-balance (default-to u0 (map-get? farmer-balances tx-sender))))
+        (asserts! (is-farmer-registered tx-sender) err-farmer-not-registered)
+        (asserts! (is-farmer-registered lessee) err-farmer-not-registered)
+        (asserts! (> amount u0) err-invalid-amount)
+        (asserts! (> duration u0) err-invalid-duration)
+        (asserts! (>= lessor-balance amount) err-insufficient-balance)
+        (asserts! (is-none (map-get? leases {lessor: tx-sender, lessee: lessee})) err-already-leased)
+        
+        (let ((start-block stacks-block-height)
+              (end-block (+ stacks-block-height duration)))
+            (map-set farmer-balances tx-sender (- lessor-balance amount))
+            (map-set farmer-balances lessee (+ (default-to u0 (map-get? farmer-balances lessee)) amount))
+            
+            (map-set leases {lessor: tx-sender, lessee: lessee} {
+                amount: amount,
+                rate-per-block: rate-per-block,
+                start-block: start-block,
+                end-block: end-block,
+                active: true
+            })
+            
+            (map-set active-leases-count tx-sender (+ (default-to u0 (map-get? active-leases-count tx-sender)) u1))
+            
+            (print {
+                operation: "lease-created",
+                lessor: tx-sender,
+                lessee: lessee,
+                amount: amount,
+                rate: rate-per-block,
+                start: start-block,
+                end: end-block
+            })
+            (ok true))))
+
+(define-public (settle-lease (lessor principal))
+    (let ((lease-data (unwrap! (map-get? leases {lessor: lessor, lessee: tx-sender}) err-lease-not-found))
+          (lessee-balance (default-to u0 (map-get? farmer-balances tx-sender))))
+        (asserts! (get active lease-data) err-lease-not-found)
+        (asserts! (>= stacks-block-height (get end-block lease-data)) err-lease-expired)
+        
+        (let ((lease-amount (get amount lease-data))
+              (blocks-elapsed (- (get end-block lease-data) (get start-block lease-data)))
+              (total-payment (* (get rate-per-block lease-data) blocks-elapsed)))
+            (asserts! (>= lessee-balance (+ lease-amount total-payment)) err-insufficient-lease-amount)
+            
+            (map-set farmer-balances tx-sender (- lessee-balance (+ lease-amount total-payment)))
+            (map-set farmer-balances lessor (+ (default-to u0 (map-get? farmer-balances lessor)) (+ lease-amount total-payment)))
+            
+            (map-set leases {lessor: lessor, lessee: tx-sender} (merge lease-data {active: false}))
+            (map-set active-leases-count lessor (- (default-to u1 (map-get? active-leases-count lessor)) u1))
+            
+            (print {
+                operation: "lease-settled",
+                lessor: lessor,
+                lessee: tx-sender,
+                amount-returned: lease-amount,
+                payment: total-payment,
+                blocks: blocks-elapsed
+            })
+            (ok total-payment))))
+
+(define-public (terminate-lease-early (lessor principal))
+    (let ((lease-data (unwrap! (map-get? leases {lessor: lessor, lessee: tx-sender}) err-lease-not-found))
+          (lessee-balance (default-to u0 (map-get? farmer-balances tx-sender))))
+        (asserts! (get active lease-data) err-lease-not-found)
+        (asserts! (< stacks-block-height (get end-block lease-data)) err-lease-expired)
+        
+        (let ((lease-amount (get amount lease-data))
+              (blocks-elapsed (- stacks-block-height (get start-block lease-data)))
+              (total-payment (* (get rate-per-block lease-data) blocks-elapsed))
+              (penalty (/ lease-amount u10)))
+            (asserts! (>= lessee-balance (+ lease-amount total-payment penalty)) err-insufficient-lease-amount)
+            
+            (map-set farmer-balances tx-sender (- lessee-balance (+ (+ lease-amount total-payment) penalty)))
+            (map-set farmer-balances lessor (+ (default-to u0 (map-get? farmer-balances lessor)) (+ (+ lease-amount total-payment) penalty)))
+            
+            (map-set leases {lessor: lessor, lessee: tx-sender} (merge lease-data {active: false}))
+            (map-set active-leases-count lessor (- (default-to u1 (map-get? active-leases-count lessor)) u1))
+            
+            (print {
+                operation: "lease-terminated-early",
+                lessor: lessor,
+                lessee: tx-sender,
+                amount-returned: lease-amount,
+                payment: total-payment,
+                penalty: penalty,
+                blocks-used: blocks-elapsed
+            })
+            (ok true))))
+
 (define-read-only (get-farmer-info (farmer principal))
     (map-get? farmers farmer))
 
@@ -263,6 +371,26 @@
                 (if (is-eq current-tier u1)
                     u10
                     u3)))))
+
+(define-read-only (get-lease-info (lessor principal) (lessee principal))
+    (map-get? leases {lessor: lessor, lessee: lessee}))
+
+(define-read-only (get-active-leases (farmer principal))
+    (default-to u0 (map-get? active-leases-count farmer)))
+
+(define-read-only (calculate-lease-cost (lessor principal) (lessee principal))
+    (match (map-get? leases {lessor: lessor, lessee: lessee})
+        lease-data 
+            (if (get active lease-data)
+                (let ((blocks-elapsed (- stacks-block-height (get start-block lease-data))))
+                    (ok (* (get rate-per-block lease-data) blocks-elapsed)))
+                (err err-lease-not-found))
+        (err err-lease-not-found)))
+
+(define-read-only (is-lease-expired (lessor principal) (lessee principal))
+    (match (map-get? leases {lessor: lessor, lessee: lessee})
+        lease-data (ok (>= stacks-block-height (get end-block lease-data)))
+        (err err-lease-not-found)))
 
 (begin
     (map-set practice-rates "drip-irrigation" u50)
